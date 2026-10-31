@@ -2,11 +2,13 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { PrismaService } from '../prisma/prisma.service.js';
 import { Currency, PreOrderMode, ProductAvailability } from '../generated/prisma/enums.js';
 import { BiteshipService, CourierRate } from './biteship.service.js';
+import { FxService } from '../fx/fx.service.js';
 import { activeDiscountPct, applyDiscount } from '../products/pricing.js';
 import {
   CartItemDto,
   CreateShippingZoneDto,
   RatesDto,
+  UpdateShippingOriginDto,
   UpdateShippingZoneDto,
 } from './dto/shipping.dto.js';
 
@@ -18,11 +20,24 @@ export type QuotedRate = CourierRate & { currency: Currency };
 
 type CartLine = Awaited<ReturnType<ShippingService['resolveCart']>>[number];
 
+/** "KOTA BAU-BAU" and "Baubau" are the same place in the two region datasets. */
+const regionKey = (name = '') =>
+  name
+    .toUpperCase()
+    .replace(/^(KOTA|KABUPATEN|KAB\.?)\s+(ADM\S*\s+)?/, '')
+    .replace(/[^A-Z0-9]/g, '');
+
+const sameRegion = (a?: string, b?: string) => {
+  const [x, y] = [regionKey(a), regionKey(b)];
+  return !!x && !!y && (x.includes(y) || y.includes(x));
+};
+
 @Injectable()
 export class ShippingService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly biteship: BiteshipService,
+    private readonly fx: FxService,
   ) {}
 
   searchAreas(q: string) {
@@ -31,7 +46,80 @@ export class ShippingService {
 
   async rates(dto: RatesDto) {
     const lines = await this.resolveCart(dto.items);
-    return this.quote(dto, lines);
+    if (dto.country_code === 'ID' && dto.city && dto.district) {
+      await this.assertDomesticAddress({
+        postal_code: dto.postal_code,
+        city: dto.city,
+        district: dto.district,
+      });
+    }
+    const rates = await this.quote(dto, lines);
+    if (dto.country_code === 'ID') return rates;
+
+    // Buyers abroad see USD but Midtrans charges IDR, so show the amount before they
+    // pay. Built per unit like the checkout total, which must match it exactly.
+    const fxRate = await this.fx.usdToIdr();
+    const goods = lines.reduce(
+      (sum, l) =>
+        sum +
+        this.fx.centsToIdr(applyDiscount(l.product.priceUsdCents, l.discountPct), fxRate) * l.quantity,
+      0,
+    );
+    return rates.map((r) => ({ ...r, charge_idr: goods + this.fx.centsToIdr(r.price, fxRate) }));
+  }
+
+  // ---------- Origin (admin) ----------
+
+  getOrigin() {
+    return this.prisma.storeOrigin.findUnique({ where: { id: 1 } });
+  }
+
+  async requireOrigin() {
+    const origin = await this.getOrigin();
+    if (!origin) throw new BadRequestException('Shipping origin is not set yet');
+    return origin;
+  }
+
+  /** The postal code drives every domestic quote, so a wrong one is refused here. */
+  async updateOrigin(dto: UpdateShippingOriginDto) {
+    const areas = await this.biteship.searchAreas(dto.postal_code);
+    if (!areas.some((a) => a.postal_code === Number(dto.postal_code))) {
+      throw new BadRequestException('Postal code not found, please check it');
+    }
+    const data = {
+      contactName: dto.contact_name,
+      phone: dto.phone,
+      address: dto.address,
+      postalCode: dto.postal_code,
+    };
+    return this.prisma.storeOrigin.upsert({
+      where: { id: 1 },
+      create: { id: 1, ...data },
+      update: data,
+    });
+  }
+
+  /**
+   * Shipping cost is quoted by postal code, so it has to belong to the chosen
+   * region. Spelling differs between datasets, hence either level may match.
+   */
+  async assertDomesticAddress(dest: { postal_code: string; city: string; district: string }) {
+    const areas = (await this.biteship.searchAreas(dest.postal_code)).filter(
+      (a) => a.postal_code === Number(dest.postal_code),
+    );
+    if (areas.length === 0) {
+      throw new BadRequestException('Postal code not found, please check it');
+    }
+    const matches = areas.some(
+      (a) =>
+        sameRegion(a.administrative_division_level_2_name, dest.city) ||
+        sameRegion(a.administrative_division_level_3_name, dest.district),
+    );
+    if (!matches) {
+      throw new BadRequestException(
+        `Postal code ${dest.postal_code} does not match ${dest.district}, ${dest.city}`,
+      );
+    }
   }
 
   /**
@@ -47,6 +135,7 @@ export class ShippingService {
         throw new BadRequestException('Indonesian postal codes have 5 digits');
       }
       const rates = await this.biteship.rates(
+        await this.requireOrigin(),
         { areaId: dest.area_id, postalCode: dest.postal_code },
         lines.map((l) => ({
           name: l.product.name,

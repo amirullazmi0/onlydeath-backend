@@ -22,6 +22,19 @@ export interface BiteshipArea {
   id: string;
   name: string;
   postal_code: number;
+  /** City / regency */
+  administrative_division_level_2_name?: string;
+  /** Kecamatan */
+  administrative_division_level_3_name?: string;
+}
+
+/** Shared fields of the order.status / order.waybill_id / order.price events. */
+export interface BiteshipWebhook {
+  order_id?: string;
+  status?: string;
+  courier_waybill_id?: string | null;
+  courier_tracking_id?: string | null;
+  courier_link?: string | null;
 }
 
 export interface ShipmentContact {
@@ -34,6 +47,14 @@ export interface ShipmentContact {
   note?: string | null;
 }
 
+export interface ShipmentOrigin {
+  contactName: string;
+  phone: string;
+  address: string;
+  postalCode: string;
+}
+
+/** Indonesia only: international orders ship manually and never reach this service. */
 @Injectable()
 export class BiteshipService {
   private readonly logger = new Logger(BiteshipService.name);
@@ -46,9 +67,13 @@ export class BiteshipService {
     return res.areas ?? [];
   }
 
-  async rates(destination: { areaId?: string; postalCode: string }, items: BiteshipItem[]) {
+  async rates(
+    origin: Pick<ShipmentOrigin, 'postalCode'>,
+    destination: { areaId?: string; postalCode: string },
+    items: BiteshipItem[],
+  ) {
     const res = await this.request<{ pricing: CourierRate[] }>('POST', '/v1/rates/couriers', {
-      ...this.origin(),
+      origin_postal_code: Number(origin.postalCode),
       ...(destination.areaId && { destination_area_id: destination.areaId }),
       destination_postal_code: Number(destination.postalCode),
       couriers: this.config.get('BITESHIP_COURIERS') ?? 'jne,jnt,sicepat',
@@ -65,26 +90,27 @@ export class BiteshipService {
     }));
   }
 
-  /** Books the courier pickup; returns Biteship order id, waybill and tracking id. */
+  /** Books the courier pickup; returns Biteship order id, waybill and tracking details. */
   async createOrder(params: {
     referenceId: string;
+    origin: ShipmentOrigin;
     destination: ShipmentContact;
     courierCode: string;
     courierService: string;
     items: BiteshipItem[];
   }) {
-    const { destination } = params;
+    const { origin, destination } = params;
     const res = await this.request<{
       id: string;
-      courier: { waybill_id: string | null; tracking_id: string | null };
+      courier: { waybill_id: string | null; tracking_id: string | null; link: string | null };
     }>('POST', '/v1/orders', {
       reference_id: params.referenceId,
-      shipper_contact_name: this.config.get('BITESHIP_ORIGIN_NAME'),
-      shipper_contact_phone: this.config.get('BITESHIP_ORIGIN_PHONE'),
-      origin_contact_name: this.config.get('BITESHIP_ORIGIN_NAME'),
-      origin_contact_phone: this.config.get('BITESHIP_ORIGIN_PHONE'),
-      origin_address: this.config.get('BITESHIP_ORIGIN_ADDRESS'),
-      ...this.origin(),
+      shipper_contact_name: origin.contactName,
+      shipper_contact_phone: origin.phone,
+      origin_contact_name: origin.contactName,
+      origin_contact_phone: origin.phone,
+      origin_address: origin.address,
+      origin_postal_code: Number(origin.postalCode),
       destination_contact_name: destination.name,
       destination_contact_phone: destination.phone,
       destination_contact_email: destination.email,
@@ -101,6 +127,7 @@ export class BiteshipService {
       biteshipId: res.id,
       waybill: res.courier?.waybill_id ?? null,
       trackingId: res.courier?.tracking_id ?? null,
+      trackingUrl: res.courier?.link ?? null,
     };
   }
 
@@ -111,14 +138,6 @@ export class BiteshipService {
       courier: { company: string; driver_name?: string; driver_phone?: string };
       history: { note: string; status: string; updated_at: string }[];
     }>('GET', `/v1/trackings/${encodeURIComponent(trackingId)}`);
-  }
-
-  private origin() {
-    const areaId = this.config.get<string>('BITESHIP_ORIGIN_AREA_ID');
-    return {
-      ...(areaId && { origin_area_id: areaId }),
-      origin_postal_code: Number(this.config.get('BITESHIP_ORIGIN_POSTAL_CODE')),
-    };
   }
 
   private async request<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
