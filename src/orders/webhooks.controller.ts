@@ -11,6 +11,7 @@ import { SkipThrottle } from '@nestjs/throttler';
 import { Public } from '../common/decorators/public.decorator.js';
 import { OrdersService } from './orders.service.js';
 import type { MidtransNotification } from './midtrans.service.js';
+import type { BiteshipWebhook } from '../shipping/biteship.service.js';
 
 @Public()
 @SkipThrottle()
@@ -33,7 +34,7 @@ export class WebhooksController {
   @HttpCode(200)
   biteship(
     @Headers() headers: Record<string, string>,
-    @Body() body: { order_id?: string; status?: string },
+    @Body() body: BiteshipWebhook,
   ) {
     const header = (this.config.get<string>('BITESHIP_WEBHOOK_HEADER') ?? 'x-biteship-token').toLowerCase();
     const token = this.config.get<string>('BITESHIP_WEBHOOK_TOKEN');
