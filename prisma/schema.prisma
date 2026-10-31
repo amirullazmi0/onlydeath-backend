@@ -1,0 +1,278 @@
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Only admins log in; buyers check out as guests.
+model User {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email            String    @unique @db.VarChar(255)
+  password         String    @db.VarChar(255)
+  name             String    @db.VarChar(255)
+  isActive         Boolean   @default(true) @map("is_active")
+  refreshTokenHash String?   @map("refresh_token_hash") @db.Text
+  resetTokenHash   String?   @map("reset_token_hash") @db.Text
+  resetTokenExpiry DateTime? @map("reset_token_expiry")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+  deletedAt        DateTime? @map("deleted_at")
+
+  @@map("users")
+}
+
+model Category {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String    @db.VarChar(255)
+  slug      String    @unique @db.VarChar(255)
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  products Product[]
+
+  @@map("categories")
+}
+
+enum ProductAvailability {
+  READY
+  PRE_ORDER
+}
+
+/// ANYTIME = always open, made per order; PERIOD = open only between poStartAt and poEndAt
+enum PreOrderMode {
+  ANYTIME
+  PERIOD
+}
+
+model Product {
+  id             String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  categoryId     String?             @map("category_id") @db.Uuid
+  name           String              @db.VarChar(255)
+  slug           String              @unique @db.VarChar(255)
+  description    String              @default("") @db.Text
+  price          Int
+  /// USD price in cents, shown to buyers outside Indonesia
+  priceUsdCents  Int                 @default(0) @map("price_usd_cents")
+  weightGram     Int                 @default(100) @map("weight_gram")
+  /// Sum of size stocks when the product has sizes
+  stock          Int                 @default(0)
+  availability   ProductAvailability @default(READY)
+  poEstimateDays Int?                @map("po_estimate_days")
+  poMode         PreOrderMode?       @map("po_mode")
+  poStartAt      DateTime?           @map("po_start_at")
+  poEndAt        DateTime?           @map("po_end_at")
+  isActive       Boolean             @default(true) @map("is_active")
+  createdAt      DateTime            @default(now()) @map("created_at")
+  updatedAt      DateTime            @updatedAt @map("updated_at")
+  deletedAt      DateTime?           @map("deleted_at")
+
+  category   Category?         @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  images     ProductImage[]
+  sizes      ProductSize[]
+  discounts  ProductDiscount[]
+  orderItems OrderItem[]
+
+  @@index([availability, isActive])
+  @@map("products")
+}
+
+model ProductImage {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId String   @map("product_id") @db.Uuid
+  url       String   @db.Text
+  fileId    String?  @map("file_id") @db.VarChar(255)
+  sort      Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@map("product_images")
+}
+
+// Percentage discounts (kratify model): the highest active one applies, no stacking.
+model ProductDiscount {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId   String    @map("product_id") @db.Uuid
+  name        String    @db.VarChar(255)
+  discountPct Int       @map("discount_pct")
+  startAt     DateTime? @map("start_at")
+  endAt       DateTime? @map("end_at")
+  isActive    Boolean   @default(true) @map("is_active")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@map("product_discounts")
+}
+
+// Size options with their own stock, e.g. S/M/L/XL or 28/30/32 for pants.
+model ProductSize {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId String   @map("product_id") @db.Uuid
+  label     String   @db.VarChar(20)
+  stock     Int      @default(0)
+  sort      Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  orderItems OrderItem[]
+
+  @@unique([productId, label])
+  @@map("product_sizes")
+}
+
+enum ShippingType {
+  DOMESTIC
+  INTERNATIONAL
+}
+
+// International rates (USD cents) for countries outside Biteship coverage (non-ID).
+model ShippingZone {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String    @db.VarChar(255)
+  countries      String[]  @db.VarChar(2)
+  baseRateCents  Int       @map("base_rate_cents")
+  perKgRateCents Int       @map("per_kg_rate_cents")
+  etaText        String    @map("eta_text") @db.VarChar(100)
+  isActive       Boolean   @default(true) @map("is_active")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  @@map("shipping_zones")
+}
+
+enum Currency {
+  IDR
+  USD
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAID
+  CONFIRMED
+  SHIPPED
+  DELIVERED
+  REJECTED
+  EXPIRED
+  CANCELLED
+}
+
+model Order {
+  id             String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderNo        String       @unique @map("order_no") @db.VarChar(40)
+  status         OrderStatus  @default(PENDING_PAYMENT)
+  customerName   String       @map("customer_name") @db.VarChar(255)
+  customerEmail  String       @map("customer_email") @db.VarChar(255)
+  customerPhone  String       @map("customer_phone") @db.VarChar(40)
+  shippingType   ShippingType @default(DOMESTIC) @map("shipping_type")
+  countryCode    String       @default("ID") @map("country_code") @db.VarChar(2)
+  address        String       @db.Text
+  city           String       @db.VarChar(255)
+  state          String?      @db.VarChar(255)
+  district       String?      @db.VarChar(255)
+  subDistrict    String?      @map("sub_district") @db.VarChar(255)
+  areaId         String?      @map("area_id") @db.VarChar(255)
+  areaName       String?      @map("area_name") @db.Text
+  postalCode     String       @map("postal_code") @db.VarChar(20)
+  note           String?      @db.Text
+  courierCode    String       @map("courier_code") @db.VarChar(50)
+  courierService String       @map("courier_service") @db.VarChar(100)
+  courierName    String       @map("courier_name") @db.VarChar(255)
+  trackingUrl    String?      @map("tracking_url") @db.Text
+  /// Amounts below are in minor units of `currency` (IDR rupiah / USD cents)
+  currency       Currency     @default(IDR)
+  subtotal       Int
+  shippingCost   Int          @map("shipping_cost")
+  /// Total discount given, in minor units of currency (already excluded from subtotal)
+  discountTotal  Int          @default(0) @map("discount_total")
+  total          Int
+  /// IDR per 1 USD locked at checkout (1 for IDR orders)
+  exchangeRate   Decimal      @default(1) @map("exchange_rate") @db.Decimal(14, 4)
+  /// What Midtrans actually charges, always IDR
+  chargeTotal    Int          @map("charge_total")
+  chargeShipping Int          @map("charge_shipping")
+  rejectReason   String?      @map("reject_reason") @db.Text
+  biteshipId     String?      @map("biteship_id") @db.VarChar(255)
+  waybill        String?      @db.VarChar(255)
+  trackingId     String?      @map("tracking_id") @db.VarChar(255)
+  paidAt         DateTime?    @map("paid_at")
+  confirmedAt    DateTime?    @map("confirmed_at")
+  shippedAt      DateTime?    @map("shipped_at")
+  deliveredAt    DateTime?    @map("delivered_at")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+
+  items   OrderItem[]
+  payment Payment?
+  logs    OrderStatusLog[]
+
+  @@index([status, createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id            String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId       String              @map("order_id") @db.Uuid
+  productId     String?             @map("product_id") @db.Uuid
+  sizeId        String?             @map("size_id") @db.Uuid
+  /// Snapshot so the label survives size edits
+  sizeLabel     String?             @map("size_label") @db.VarChar(20)
+  name          String              @db.VarChar(255)
+  imageUrl      String?             @map("image_url") @db.Text
+  price         Int
+  /// Unit price before discount; `price` is the discounted unit price
+  originalPrice Int                 @default(0) @map("original_price")
+  discountPct   Int                 @default(0) @map("discount_pct")
+  quantity      Int
+  weightGram    Int                 @map("weight_gram")
+  availability  ProductAvailability
+
+  order   Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product?     @relation(fields: [productId], references: [id], onDelete: SetNull)
+  size    ProductSize? @relation(fields: [sizeId], references: [id], onDelete: SetNull)
+
+  @@map("order_items")
+}
+
+model Payment {
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId           String    @unique @map("order_id") @db.Uuid
+  snapToken         String?   @map("snap_token") @db.Text
+  redirectUrl       String?   @map("redirect_url") @db.Text
+  paymentType       String?   @map("payment_type") @db.VarChar(50)
+  transactionId     String?   @map("transaction_id") @db.VarChar(255)
+  transactionStatus String?   @map("transaction_status") @db.VarChar(50)
+  grossAmount       Int       @map("gross_amount")
+  rawNotification   Json?     @map("raw_notification")
+  paidAt            DateTime? @map("paid_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@map("payments")
+}
+
+model OrderStatusLog {
+  id        String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId   String      @map("order_id") @db.Uuid
+  status    OrderStatus
+  note      String?     @db.Text
+  actor     String?     @db.VarChar(255)
+  createdAt DateTime    @default(now()) @map("created_at")
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, createdAt])
+  @@map("order_status_logs")
+}
