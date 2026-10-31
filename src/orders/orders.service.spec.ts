@@ -123,6 +123,28 @@ describe('OrdersService.checkout destination rules', () => {
   });
 });
 
+describe('OrdersService.handleMidtransNotification', () => {
+  it('accepts a signed notification for an unknown order, like the dashboard test', async () => {
+    const { service, prisma } = setup();
+    prisma.order.findUnique.mockResolvedValue(null);
+
+    await expect(
+      service.handleMidtransNotification({ order_id: 'payment_notif_test' } as never),
+    ).resolves.toBeUndefined();
+
+    expect(prisma.order.update).not.toHaveBeenCalled();
+  });
+
+  it('still rejects a bad signature', async () => {
+    const { service, midtrans } = setup();
+    midtrans.verifySignature.mockReturnValue(false);
+
+    await expect(
+      service.handleMidtransNotification({ order_id: 'OD-1' } as never),
+    ).rejects.toThrow('Invalid signature');
+  });
+});
+
 describe('OrdersService.cancel', () => {
   const dto = { order_no: 'od-1', email: 'Buyer@Example.com' };
   const cancelSetup = () => {

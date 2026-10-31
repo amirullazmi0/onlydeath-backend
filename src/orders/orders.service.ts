@@ -390,7 +390,12 @@ export class OrdersService {
       where: { orderNo: n.order_id },
       include: { items: true, payment: true },
     });
-    if (!order) throw new NotFoundException('Order not found');
+    // Signed but not ours, like the dashboard's test button. A non-2xx answer would
+    // fail that test and make Midtrans retry an order that will never exist.
+    if (!order) {
+      this.logger.warn(`Ignored Midtrans notification for unknown order ${n.order_id}`);
+      return;
+    }
 
     const outcome = this.midtrans.resolveOutcome(n);
     const paymentData = {
