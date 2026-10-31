@@ -267,7 +267,7 @@ export class OrdersService {
     if (transaction) {
       const outcome = this.midtrans.resolveOutcome(transaction);
       if (outcome === 'PAID') {
-        await this.handleMidtransNotification(transaction);
+        await this.applyPaymentStatus(transaction);
         throw new ConflictException('This order has already been paid');
       }
       if (outcome === 'PENDING') await this.midtrans.cancel(order.orderNo);
@@ -383,19 +383,32 @@ export class OrdersService {
 
   // ---------- Midtrans webhook ----------
 
-  async handleMidtransNotification(n: MidtransNotification) {
-    if (!this.midtrans.verifySignature(n)) throw new BadRequestException('Invalid signature');
+  /**
+   * A notification only says "look at this order". The state comes from Midtrans
+   * itself over our authenticated API call, so a forged request changes nothing.
+   * Unknown ids get a 2xx: the dashboard's test button sends one, and an error
+   * would fail that test and make Midtrans retry an order that will never exist.
+   */
+  async handleMidtransNotification(n: Pick<MidtransNotification, 'order_id'>) {
+    const orderNo = n?.order_id;
+    const known =
+      typeof orderNo === 'string' &&
+      (await this.prisma.order.findUnique({ where: { orderNo }, select: { id: true } }));
+    if (!known) {
+      this.logger.warn(`Ignored Midtrans notification for unknown order ${String(orderNo)}`);
+      return;
+    }
 
+    const status = await this.midtrans.getStatus(orderNo);
+    if (status) await this.applyPaymentStatus(status);
+  }
+
+  private async applyPaymentStatus(n: MidtransNotification) {
     const order = await this.prisma.order.findUnique({
       where: { orderNo: n.order_id },
       include: { items: true, payment: true },
     });
-    // Signed but not ours, like the dashboard's test button. A non-2xx answer would
-    // fail that test and make Midtrans retry an order that will never exist.
-    if (!order) {
-      this.logger.warn(`Ignored Midtrans notification for unknown order ${n.order_id}`);
-      return;
-    }
+    if (!order) return;
 
     const outcome = this.midtrans.resolveOutcome(n);
     const paymentData = {
@@ -479,7 +492,7 @@ export class OrdersService {
       try {
         const status = await this.midtrans.getStatus(order.orderNo);
         if (status) {
-          await this.handleMidtransNotification(status);
+          await this.applyPaymentStatus(status);
         } else {
           const closed = await this.prisma.$transaction((tx) =>
             this.closeUnpaid(tx, order.id, OrderStatus.EXPIRED, 'Payment window expired'),

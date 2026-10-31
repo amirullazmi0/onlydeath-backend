@@ -71,7 +71,6 @@ const setup = () => {
   };
   const midtrans = {
     getStatus: vi.fn(),
-    verifySignature: vi.fn(() => true),
     resolveOutcome: vi.fn(() => 'FAILED'),
   };
   const mail = { sendInBackground: vi.fn() };
@@ -124,24 +123,53 @@ describe('OrdersService.checkout destination rules', () => {
 });
 
 describe('OrdersService.handleMidtransNotification', () => {
-  it('accepts a signed notification for an unknown order, like the dashboard test', async () => {
-    const { service, prisma } = setup();
+  it('ignores unknown orders without asking Midtrans, like the dashboard test', async () => {
+    const { service, midtrans, prisma } = setup();
     prisma.order.findUnique.mockResolvedValue(null);
 
     await expect(
-      service.handleMidtransNotification({ order_id: 'payment_notif_test' } as never),
+      service.handleMidtransNotification({ order_id: 'payment_notif_test' }),
     ).resolves.toBeUndefined();
 
+    expect(midtrans.getStatus).not.toHaveBeenCalled();
     expect(prisma.order.update).not.toHaveBeenCalled();
   });
 
-  it('still rejects a bad signature', async () => {
-    const { service, midtrans } = setup();
-    midtrans.verifySignature.mockReturnValue(false);
+  it('ignores a malformed body', async () => {
+    const { service, prisma } = setup();
+    await expect(service.handleMidtransNotification({} as never)).resolves.toBeUndefined();
+    expect(prisma.order.findUnique).not.toHaveBeenCalled();
+  });
 
-    await expect(
-      service.handleMidtransNotification({ order_id: 'OD-1' } as never),
-    ).rejects.toThrow('Invalid signature');
+  it('marks an order paid only when Midtrans itself says so', async () => {
+    const { service, midtrans, order } = setup();
+    midtrans.getStatus.mockResolvedValue({ order_id: 'OD-1', transaction_status: 'settlement' });
+    midtrans.resolveOutcome.mockReturnValue('PAID');
+
+    await service.handleMidtransNotification({ order_id: 'OD-1' });
+
+    expect(order.status).toBe(OrderStatus.PAID);
+  });
+
+  it('cannot be fooled by a forged settlement', async () => {
+    const { service, midtrans, order } = setup();
+    midtrans.getStatus.mockResolvedValue({ order_id: 'OD-1', transaction_status: 'pending' });
+    midtrans.resolveOutcome.mockReturnValue('PENDING');
+    const forged = { order_id: 'OD-1', transaction_status: 'settlement' };
+
+    await service.handleMidtransNotification(forged);
+
+    expect(midtrans.resolveOutcome).toHaveBeenCalledWith({ order_id: 'OD-1', transaction_status: 'pending' });
+    expect(order.status).toBe(OrderStatus.PENDING_PAYMENT);
+  });
+
+  it('lets Midtrans retry when its status cannot be read', async () => {
+    const { service, midtrans } = setup();
+    midtrans.getStatus.mockRejectedValue(new Error('Midtrans status failed'));
+
+    await expect(service.handleMidtransNotification({ order_id: 'OD-1' })).rejects.toThrow(
+      'Midtrans status failed',
+    );
   });
 });
 
@@ -214,13 +242,15 @@ describe('OrdersService.cancel', () => {
     midtrans.resolveOutcome.mockReturnValue('PAID');
     const notification = { order_id: 'OD-1', transaction_status: 'settlement' };
 
-    await service.handleMidtransNotification(notification as never);
+    midtrans.getStatus.mockResolvedValue(notification);
+
+    await service.handleMidtransNotification(notification);
     expect(logs[0].note).toContain('refund');
 
     prisma.order.findUnique.mockImplementation(
       async () => ({ ...order, items: [], payment: { transactionStatus: 'settlement' } }) as never,
     );
-    await service.handleMidtransNotification(notification as never);
+    await service.handleMidtransNotification(notification);
     expect(logs).toHaveLength(1);
   });
 });
@@ -464,7 +494,7 @@ describe('OrdersService.expireStaleOrders', () => {
 
     await service.expireStaleOrders();
 
-    expect(midtrans.verifySignature).toHaveBeenCalled();
+    expect(midtrans.resolveOutcome).toHaveBeenCalled();
     expect(order.status).toBe(OrderStatus.EXPIRED);
   });
 

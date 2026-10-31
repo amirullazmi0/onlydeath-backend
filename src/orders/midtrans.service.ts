@@ -1,6 +1,5 @@
 import { BadGatewayException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createHash, timingSafeEqual } from 'node:crypto';
 
 /** How long a buyer has to pay, counted from checkout. */
 export const PAYMENT_WINDOW_MINUTES = 10;
@@ -13,7 +12,6 @@ export interface MidtransNotification {
   order_id: string;
   status_code: string;
   gross_amount: string;
-  signature_key: string;
   transaction_status: string;
   transaction_id?: string;
   payment_type?: string;
@@ -95,8 +93,7 @@ export class MidtransService {
 
   /**
    * Current transaction state, or null when Midtrans has none: Snap only creates
-   * one after the buyer picks a payment method. The body has the same shape as a
-   * notification, signature_key included.
+   * one after the buyer picks a payment method.
    */
   async getStatus(orderNo: string) {
     const res = await fetch(`${this.apiBase}/v2/${encodeURIComponent(orderNo)}/status`, {
@@ -129,15 +126,6 @@ export class MidtransService {
       this.logger.error(`Midtrans cancel failed for ${orderNo}: ${body.status_code} ${body.status_message}`);
       throw new BadGatewayException('Could not cancel the payment, please try again');
     }
-  }
-
-  /** signature_key = SHA512(order_id + status_code + gross_amount + server_key) */
-  verifySignature(n: MidtransNotification) {
-    const expected = createHash('sha512')
-      .update(`${n.order_id}${n.status_code}${n.gross_amount}${this.serverKey}`)
-      .digest('hex');
-    const given = Buffer.from(n.signature_key ?? '');
-    return given.length === expected.length && timingSafeEqual(given, Buffer.from(expected));
   }
 
   /** Maps Midtrans transaction state to our outcome. */
