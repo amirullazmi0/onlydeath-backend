@@ -151,6 +151,18 @@ model ShippingZone {
   @@map("shipping_zones")
 }
 
+// Sender address for Biteship (Indonesia only). Single row, edited from admin settings.
+model StoreOrigin {
+  id          Int      @id @default(1)
+  contactName String   @map("contact_name") @db.VarChar(255)
+  phone       String   @db.VarChar(30)
+  address     String   @db.Text
+  postalCode  String   @map("postal_code") @db.VarChar(10)
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("store_origin")
+}
+
 enum Currency {
   IDR
   USD
@@ -189,6 +201,8 @@ model Order {
   courierService String       @map("courier_service") @db.VarChar(100)
   courierName    String       @map("courier_name") @db.VarChar(255)
   trackingUrl    String?      @map("tracking_url") @db.Text
+  // AWB / customs paperwork uploaded by the admin for manual international shipments
+  shippingDocumentUrl String? @map("shipping_document_url") @db.Text
   /// Amounts below are in minor units of `currency` (IDR rupiah / USD cents)
   currency       Currency     @default(IDR)
   subtotal       Int

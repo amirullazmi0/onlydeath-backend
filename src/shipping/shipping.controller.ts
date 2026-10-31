@@ -18,6 +18,7 @@ import {
   AreaQueryDto,
   CreateShippingZoneDto,
   RatesDto,
+  UpdateShippingOriginDto,
   UpdateShippingZoneDto,
 } from './dto/shipping.dto.js';
 
@@ -38,6 +39,17 @@ export class ShippingController {
   @HttpCode(200)
   rates(@Body() dto: RatesDto) {
     return this.shipping.rates(dto);
+  }
+
+  @Get('origin')
+  origin() {
+    return this.shipping.getOrigin();
+  }
+
+  @Patch('origin')
+  @ResponseMessage('Shipping origin updated')
+  updateOrigin(@Body() dto: UpdateShippingOriginDto) {
+    return this.shipping.updateOrigin(dto);
   }
 
   @Get('zones')

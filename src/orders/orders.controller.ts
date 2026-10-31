@@ -41,6 +41,15 @@ export class OrdersController {
     return this.orders.track(query);
   }
 
+  @Public()
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @Post('cancel')
+  @HttpCode(200)
+  @ResponseMessage('Order cancelled')
+  cancel(@Body() dto: TrackQueryDto) {
+    return this.orders.cancel(dto);
+  }
+
   @Get()
   list(@Query() query: OrderQueryDto) {
     return this.orders.list(query);

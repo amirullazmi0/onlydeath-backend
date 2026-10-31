@@ -1,10 +1,13 @@
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module.js';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create<NestExpressApplication>(AppModule);
 
+  // Requests arrive through the Next BFF; rate limits must see the buyer's IP, not its
+  app.set('trust proxy', 1);
   app.setGlobalPrefix('api');
   app.enableCors({
     origin: (process.env.FE_URL ?? 'http://localhost:3000').split(','),

@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
+import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { PrismaModule } from './prisma/prisma.module.js';
 import { MailModule } from './mail/mail.module.js';
@@ -26,6 +27,7 @@ import { AppService } from './app.service.js';
     ConfigModule.forRoot({ isGlobal: true }),
     JwtModule.register({ global: true }),
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 120 }]),
+    ScheduleModule.forRoot(),
     PrismaModule,
     MailModule,
     FxModule,

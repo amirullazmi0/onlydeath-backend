@@ -2,20 +2,22 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Cron } from '@nestjs/schedule';
 import { randomBytes } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { MailService } from '../mail/mail.service.js';
 import { ShippingService } from '../shipping/shipping.service.js';
-import { BiteshipService } from '../shipping/biteship.service.js';
+import { BiteshipService, BiteshipWebhook } from '../shipping/biteship.service.js';
 import { paginate } from '../common/dto/pagination.dto.js';
 import { Currency, OrderStatus, ProductAvailability, ShippingType } from '../generated/prisma/enums.js';
 import { FxService } from '../fx/fx.service.js';
-import { applyDiscount } from '../products/pricing.js';
+import { activeDiscountPct, applyDiscount } from '../products/pricing.js';
 import type { Prisma } from '../generated/prisma/client.js';
-import { MidtransNotification, MidtransService } from './midtrans.service.js';
+import { MidtransNotification, MidtransService, PAYMENT_WINDOW_MINUTES } from './midtrans.service.js';
 import { CheckoutDto, ManualShipDto, OrderQueryDto, TrackQueryDto } from './dto/order.dto.js';
 
 type Tx = Prisma.TransactionClient;
@@ -63,8 +65,14 @@ const detailInclude = {
 
 type OrderDetail = Prisma.OrderGetPayload<{ include: typeof detailInclude }>;
 
+/** Two minutes past the payment window, which leaves room for late notifications. */
+const STALE_ORDER_MS = (PAYMENT_WINDOW_MINUTES + 2) * 60 * 1000;
+const STALE_ORDER_BATCH = 100;
+
 @Injectable()
 export class OrdersService {
+  private readonly logger = new Logger(OrdersService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly shipping: ShippingService,
@@ -78,8 +86,22 @@ export class OrdersService {
   // ---------- Buyer ----------
 
   async checkout(dto: CheckoutDto) {
-    const lines = await this.shipping.resolveCart(dto.items);
     const isDomestic = dto.country_code === 'ID';
+    // Indonesia pays in IDR; everyone else sees USD and is charged the IDR
+    // equivalent (Midtrans settles in IDR), with the rate locked here.
+    const currency = isDomestic ? Currency.IDR : Currency.USD;
+    // Prices differ per currency, so a mismatch means the buyer saw the wrong total
+    if (dto.currency !== currency) {
+      throw new BadRequestException(
+        isDomestic
+          ? 'Orders shipping to Indonesia are paid in IDR'
+          : 'Orders shipping outside Indonesia are paid in USD',
+      );
+    }
+    this.assertPhone(dto.customer_phone, isDomestic);
+
+    const lines = await this.shipping.resolveCart(dto.items);
+    if (isDomestic) await this.shipping.assertDomesticAddress(dto);
 
     // Re-quote shipping server-side so the client cannot tamper with the cost
     const rates = await this.shipping.quote(dto, lines);
@@ -88,9 +110,6 @@ export class OrdersService {
     );
     if (!rate) throw new BadRequestException('Shipping option unavailable, please reselect');
 
-    // Indonesia pays in IDR; everyone else sees USD and is charged the IDR
-    // equivalent (Midtrans settles in IDR), with the rate locked here.
-    const currency = isDomestic ? Currency.IDR : Currency.USD;
     if (!isDomestic) {
       const missing = lines.find((l) => l.product.priceUsdCents <= 0);
       if (missing) {
@@ -198,6 +217,8 @@ export class OrdersService {
           { id: 'SHIPPING', name: `Shipping ${order.courierName}`, price: order.chargeShipping, quantity: 1 },
         ],
         customer: { name: order.customerName, email: order.customerEmail, phone: order.customerPhone },
+        // VA, QRIS and e-wallets need an Indonesian account; cards work from anywhere
+        ...(!isDomestic && { enabledPayments: ['credit_card'] }),
       });
 
       await this.prisma.payment.create({
@@ -208,6 +229,7 @@ export class OrdersService {
           grossAmount: order.chargeTotal,
         },
       });
+      this.sendPaymentRequest(order);
 
       return {
         order_no: orderNo,
@@ -223,12 +245,80 @@ export class OrdersService {
     }
   }
 
-  async track({ order_no, email }: TrackQueryDto) {
+  private async findForBuyer({ order_no, email }: TrackQueryDto) {
     const order = await this.prisma.order.findFirst({
       where: { orderNo: order_no.trim().toUpperCase(), customerEmail: email.toLowerCase() },
       include: detailInclude,
     });
     if (!order) throw new NotFoundException('Order not found, check the order number and email');
+    return order;
+  }
+
+  /**
+   * Buyer cancels an unpaid order, also how they switch payment method: Snap locks
+   * the method once picked and an order id cannot be reused, so they check out again.
+   * Midtrans is asked first because a payment may have landed before its webhook.
+   */
+  async cancel(dto: TrackQueryDto) {
+    const order = await this.findForBuyer(dto);
+    this.assertStatus(order.status, [OrderStatus.PENDING_PAYMENT]);
+
+    const transaction = await this.midtrans.getStatus(order.orderNo);
+    if (transaction) {
+      const outcome = this.midtrans.resolveOutcome(transaction);
+      if (outcome === 'PAID') {
+        await this.handleMidtransNotification(transaction);
+        throw new ConflictException('This order has already been paid');
+      }
+      if (outcome === 'PENDING') await this.midtrans.cancel(order.orderNo);
+    }
+
+    await this.prisma.$transaction((tx) =>
+      this.closeUnpaid(tx, order.id, OrderStatus.CANCELLED, 'Cancelled by buyer'),
+    );
+    this.notifyStatus(
+      { ...order, status: OrderStatus.CANCELLED },
+      'Your order has been cancelled and no payment was taken. You can place a new order anytime.',
+    );
+    return { order_no: order.orderNo, cart_items: await this.toCartItems(order) };
+  }
+
+  /** Puts a cancelled order back in the guest cart, at today's prices and stock. */
+  private async toCartItems(order: OrderDetail) {
+    const productIds = order.items.flatMap((i) => i.productId ?? []);
+    const products = await this.prisma.product.findMany({
+      where: { id: { in: productIds }, deletedAt: null, isActive: true },
+      include: { images: { orderBy: { sort: 'asc' }, take: 1 }, sizes: true, discounts: true },
+    });
+
+    return order.items.flatMap((item) => {
+      const product = products.find((p) => p.id === item.productId);
+      const size = product?.sizes.find((s) => s.id === item.sizeId);
+      if (!product || (item.sizeId && !size)) return [];
+      const ready = product.availability === ProductAvailability.READY;
+      const stock = ready ? (size?.stock ?? product.stock) : undefined;
+      if (stock === 0) return [];
+      return [
+        {
+          product_id: product.id,
+          size_id: size?.id,
+          size_label: size?.label,
+          slug: product.slug,
+          name: product.name,
+          image_url: product.images[0]?.url,
+          price: product.price,
+          price_usd_cents: product.priceUsdCents,
+          discount_pct: activeDiscountPct(product.discounts),
+          availability: product.availability,
+          stock,
+          quantity: item.quantity,
+        },
+      ];
+    });
+  }
+
+  async track(dto: TrackQueryDto) {
+    const order = await this.findForBuyer(dto);
 
     let tracking: Awaited<ReturnType<BiteshipService['tracking']>> | null = null;
     if (order.trackingId) {
@@ -298,7 +388,7 @@ export class OrdersService {
 
     const order = await this.prisma.order.findUnique({
       where: { orderNo: n.order_id },
-      include: { items: true },
+      include: { items: true, payment: true },
     });
     if (!order) throw new NotFoundException('Order not found');
 
@@ -313,6 +403,20 @@ export class OrdersService {
     // Midtrans retries notifications; only PENDING_PAYMENT orders can transition
     if (order.status !== OrderStatus.PENDING_PAYMENT) {
       await this.prisma.payment.update({ where: { orderId: order.id }, data: paymentData });
+      // A Snap tab left open can still be paid after the order closed; its stock is
+      // gone, so the admin has to refund it. Retried webhooks must not log this twice.
+      const closed = order.status === OrderStatus.CANCELLED || order.status === OrderStatus.EXPIRED;
+      if (outcome === 'PAID' && closed && order.payment?.transactionStatus !== n.transaction_status) {
+        this.logger.warn(`Payment received after ${order.orderNo} closed`);
+        await this.prisma.orderStatusLog.create({
+          data: {
+            orderId: order.id,
+            status: order.status,
+            // Buyers see this log on the track page
+            note: 'Payment received after this order closed, a refund is required',
+          },
+        });
+      }
       return;
     }
 
@@ -339,14 +443,49 @@ export class OrdersService {
     if (outcome === 'FAILED') {
       const status =
         n.transaction_status === 'expire' ? OrderStatus.EXPIRED : OrderStatus.CANCELLED;
-      await this.prisma.$transaction(async (tx) => {
+      const closed = await this.prisma.$transaction(async (tx) => {
         await tx.payment.update({ where: { orderId: order.id }, data: paymentData });
-        await this.closeUnpaid(tx, order.id, status, `Payment ${n.transaction_status}`);
+        return this.closeUnpaid(tx, order.id, status, `Payment ${n.transaction_status}`);
       });
+      if (closed && status === OrderStatus.EXPIRED) this.notifyExpired(order);
       return;
     }
 
     await this.prisma.payment.update({ where: { orderId: order.id }, data: paymentData });
+  }
+
+  /**
+   * Midtrans never notifies about a Snap the buyer closed before picking a
+   * payment method, so those orders would hold their stock forever. Anything
+   * Midtrans does know about goes through the normal notification flow.
+   */
+  @Cron('* * * * *')
+  async expireStaleOrders() {
+    const orders = await this.prisma.order.findMany({
+      where: {
+        status: OrderStatus.PENDING_PAYMENT,
+        createdAt: { lt: new Date(Date.now() - STALE_ORDER_MS) },
+      },
+      orderBy: { createdAt: 'asc' },
+      take: STALE_ORDER_BATCH,
+    });
+
+    for (const order of orders) {
+      try {
+        const status = await this.midtrans.getStatus(order.orderNo);
+        if (status) {
+          await this.handleMidtransNotification(status);
+        } else {
+          const closed = await this.prisma.$transaction((tx) =>
+            this.closeUnpaid(tx, order.id, OrderStatus.EXPIRED, 'Payment window expired'),
+          );
+          if (closed) this.notifyExpired(order);
+        }
+      } catch (err) {
+        // Left pending on purpose: the next run retries it
+        this.logger.warn(`Could not expire ${order.orderNo}: ${(err as Error).message}`);
+      }
+    }
   }
 
   // ---------- Admin ----------
@@ -399,7 +538,8 @@ export class OrdersService {
 
   /**
    * Domestic: books a Biteship pickup (waybill + live tracking).
-   * International: records the courier and tracking number entered by the admin.
+   * International: never touches Biteship; records the courier, tracking number
+   * and shipping document entered by the admin.
    * Separate from confirm so PO orders can wait for production.
    */
   async ship(id: string, dto: ManualShipDto, actor: string) {
@@ -410,6 +550,7 @@ export class OrdersService {
     if (order.shippingType === ShippingType.DOMESTIC) {
       const shipment = await this.biteship.createOrder({
         referenceId: order.orderNo,
+        origin: await this.shipping.requireOrigin(),
         destination: {
           name: order.customerName,
           phone: order.customerPhone,
@@ -432,6 +573,7 @@ export class OrdersService {
         biteshipId: shipment.biteshipId,
         waybill: shipment.waybill,
         trackingId: shipment.trackingId,
+        trackingUrl: shipment.trackingUrl,
       };
     } else {
       if (!dto.courier_name || !dto.tracking_number) {
@@ -441,6 +583,7 @@ export class OrdersService {
         courierName: `${dto.courier_name} (${order.courierName})`,
         waybill: dto.tracking_number,
         trackingUrl: dto.tracking_url,
+        shippingDocumentUrl: dto.shipping_document_url,
       };
     }
 
@@ -497,8 +640,20 @@ export class OrdersService {
 
   // ---------- Biteship webhook ----------
 
-  async handleBiteshipWebhook(body: { order_id?: string; status?: string }) {
-    if (!body.order_id || body.status !== 'delivered') return;
+  async handleBiteshipWebhook(body: BiteshipWebhook) {
+    if (!body.order_id) return;
+
+    // The waybill can be missing at booking and changes when the courier hands over
+    const shipment = {
+      ...(body.courier_waybill_id && { waybill: body.courier_waybill_id }),
+      ...(body.courier_tracking_id && { trackingId: body.courier_tracking_id }),
+      ...(body.courier_link && { trackingUrl: body.courier_link }),
+    };
+    if (Object.keys(shipment).length > 0) {
+      await this.prisma.order.updateMany({ where: { biteshipId: body.order_id }, data: shipment });
+    }
+
+    if (body.status !== 'delivered') return;
     const order = await this.prisma.order.findFirst({
       where: { biteshipId: body.order_id, status: OrderStatus.SHIPPED },
       include: detailInclude,
@@ -522,12 +677,17 @@ export class OrdersService {
     return updated;
   }
 
+  /** Returns false when the order was already closed by something else. */
   private async closeUnpaid(tx: Tx, orderId: string, status: OrderStatus, note: string) {
-    await this.restoreStock(tx, orderId);
-    await tx.order.update({
-      where: { id: orderId },
-      data: { status, logs: { create: { status, note } } },
+    // Conditional update so a webhook and the expiry job cannot both restore stock
+    const { count } = await tx.order.updateMany({
+      where: { id: orderId, status: OrderStatus.PENDING_PAYMENT },
+      data: { status },
     });
+    if (count === 0) return false;
+    await tx.orderStatusLog.create({ data: { orderId, status, note } });
+    await this.restoreStock(tx, orderId);
+    return true;
   }
 
   private async restoreStock(tx: Tx, orderId: string) {
@@ -545,6 +705,17 @@ export class OrdersService {
         where: { id: item.productId },
         data: { stock: { increment: item.quantity } },
       });
+    }
+  }
+
+  /** Couriers need a reachable number: Indonesian mobile, or international format abroad. */
+  private assertPhone(phone: string, isDomestic: boolean) {
+    const digits = phone.replace(/[\s()-]/g, '');
+    if (isDomestic && !/^(\+62|62|0)8\d{7,12}$/.test(digits)) {
+      throw new BadRequestException('Invalid Indonesian mobile number');
+    }
+    if (!isDomestic && !digits.startsWith('+')) {
+      throw new BadRequestException('Phone number must include the country code, e.g. +1');
     }
   }
 
@@ -606,6 +777,7 @@ export class OrdersService {
 
     this.mail.sendInBackground(order.customerEmail, `Invoice ${order.orderNo}`, 'invoice', {
       store: this.storeInfo(),
+      logoUrl: `${this.config.getOrThrow('FE_URL')}/brand/logo-black.png`,
       orderNo: order.orderNo,
       invoiceDate: paidAt.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }),
       customerName: order.customerName,
@@ -627,6 +799,8 @@ export class OrdersService {
         quantity: i.quantity,
         lineTotal: m((i.originalPrice || i.price) * i.quantity),
       })),
+      // Keeps the column lines running down the page on short orders
+      blankRows: Array.from({ length: Math.max(0, 4 - order.items.length) }),
       subtotal: m(originalSubtotal),
       discountTotal: order.discountTotal ? `- ${m(order.discountTotal)}` : null,
       shippingCost: m(order.shippingCost),
@@ -638,7 +812,44 @@ export class OrdersService {
     });
   }
 
-  private notifyStatus(order: OrderDetail, note: string) {
+  private sendPaymentRequest(order: Prisma.OrderGetPayload<{ include: { items: true } }>) {
+    const m = (n: number) => money(n, order.currency);
+    const params = new URLSearchParams({ order_no: order.orderNo, email: order.customerEmail });
+    const url = `${this.config.getOrThrow('FE_URL')}/track?${params}`;
+
+    this.mail.sendInBackground(
+      order.customerEmail,
+      `Complete your payment for ${order.orderNo}`,
+      'order-placed',
+      {
+        orderNo: order.orderNo,
+        customerName: order.customerName,
+        items: order.items.map((i) => ({
+          name: i.name,
+          details: i.sizeLabel && `Size ${i.sizeLabel}`,
+          quantity: i.quantity,
+          lineTotal: m(i.price * i.quantity),
+        })),
+        courierName: order.courierName,
+        shippingCost: m(order.shippingCost),
+        total: m(order.total),
+        chargedIdr: order.currency === Currency.USD ? money(order.chargeTotal, Currency.IDR) : null,
+        paymentMinutes: PAYMENT_WINDOW_MINUTES,
+        payUrl: url,
+        // Only opens a confirmation: mail scanners follow every link they see
+        cancelUrl: `${url}&action=cancel`,
+      },
+    );
+  }
+
+  private notifyExpired(order: Prisma.OrderGetPayload<object>) {
+    this.notifyStatus(
+      { ...order, status: OrderStatus.EXPIRED },
+      `The ${PAYMENT_WINDOW_MINUTES}-minute payment window has ended, so this order was cancelled and no payment was taken. You can place a new order anytime.`,
+    );
+  }
+
+  private notifyStatus(order: Prisma.OrderGetPayload<object>, note: string) {
     this.mail.sendInBackground(
       order.customerEmail,
       `Order ${order.orderNo}: ${STATUS_LABEL[order.status]}`,

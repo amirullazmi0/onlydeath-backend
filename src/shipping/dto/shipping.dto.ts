@@ -53,6 +53,15 @@ export class RatesDto {
   @IsString()
   area_id?: string;
 
+  /** With district: checks an Indonesian postal code against the chosen region */
+  @IsOptional()
+  @IsString()
+  city?: string;
+
+  @IsOptional()
+  @IsString()
+  district?: string;
+
   @Matches(POSTAL_CODE_REGEX, { message: 'Invalid postal code' })
   postal_code: string;
 
@@ -61,6 +70,25 @@ export class RatesDto {
   @ValidateNested({ each: true })
   @Type(() => CartItemDto)
   items: CartItemDto[];
+}
+
+/** Sender address used by Biteship. */
+export class UpdateShippingOriginDto {
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString()
+  @MinLength(2)
+  contact_name: string;
+
+  @Matches(/^(\+62|62|0)[0-9 -]{8,16}$/, { message: 'Invalid Indonesian phone number' })
+  phone: string;
+
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @IsString()
+  @MinLength(10)
+  address: string;
+
+  @Matches(/^\d{5}$/, { message: 'Indonesian postal codes have 5 digits' })
+  postal_code: string;
 }
 
 export class CreateShippingZoneDto {
