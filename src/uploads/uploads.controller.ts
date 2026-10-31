@@ -13,6 +13,7 @@ import { ResponseMessage } from '../common/decorators/message.decorator.js';
 
 const MAX_SIZE = 5 * 1024 * 1024;
 const ALLOWED = ['image/jpeg', 'image/png', 'image/webp'];
+const ALLOWED_DOCUMENTS = ['application/pdf', 'image/jpeg', 'image/png'];
 
 @Injectable()
 export class ImageKitService {
@@ -34,7 +35,7 @@ export class ImageKitService {
     });
     const body = (await res.json()) as { url?: string; fileId?: string; message?: string };
     if (!res.ok || !body.url) {
-      throw new BadRequestException(body.message ?? 'Image upload failed');
+      throw new BadRequestException(body.message ?? 'Upload failed');
     }
     return { url: body.url, file_id: body.fileId };
   }
@@ -51,6 +52,18 @@ export class UploadsController {
     if (!file) throw new BadRequestException('File is required');
     if (!ALLOWED.includes(file.mimetype)) {
       throw new BadRequestException('Image must be JPG, PNG or WEBP');
+    }
+    return this.imagekit.upload(file);
+  }
+
+  /** Shipping paperwork for manual international orders. */
+  @Post('document')
+  @ResponseMessage('Document uploaded')
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: MAX_SIZE } }))
+  uploadDocument(@UploadedFile() file?: Express.Multer.File) {
+    if (!file) throw new BadRequestException('File is required');
+    if (!ALLOWED_DOCUMENTS.includes(file.mimetype)) {
+      throw new BadRequestException('Document must be PDF, JPG or PNG');
     }
     return this.imagekit.upload(file);
   }
