@@ -25,7 +25,8 @@
     "migrate:dev": "prisma migrate dev",
     "migrate:deploy": "prisma migrate deploy",
     "db:seed": "prisma db seed",
-    "studio": "prisma studio"
+    "studio": "prisma studio",
+    "deploy:vps": "caprover deploy"
   },
   "dependencies": {
     "@nestjs/common": "^12.0.1",
