@@ -549,6 +549,66 @@ describe('OrdersService.handleBiteshipWebhook', () => {
 
     expect(order.trackingUrl).toBe('https://track.example/1');
   });
+
+  const shipped = () => {
+    const ctx = setup();
+    const logs: { note: string }[] = [];
+    Object.assign(ctx.order, { status: OrderStatus.SHIPPED, customerEmail: 'buyer@example.com' });
+    ctx.prisma.order.findFirst.mockImplementation(async () => ({ ...ctx.order, items: [], payment: null, logs }));
+    ctx.prisma.orderStatusLog.create.mockImplementation(async ({ data }) => {
+      logs.push(data);
+    });
+    return { ...ctx, statusLogs: logs };
+  };
+  const sentNotes = (mail: { sendInBackground: ReturnType<typeof vi.fn> }) =>
+    mail.sendInBackground.mock.calls.map((c) => (c[3] as { note: string }).note);
+
+  it.each(['picked', 'in_transit', 'dropping_off'])('emails the buyer once on %s', async (status) => {
+    const { service, mail, statusLogs } = shipped();
+
+    await service.handleBiteshipWebhook({ order_id: 'bs-1', status });
+    await service.handleBiteshipWebhook({ order_id: 'bs-1', status });
+
+    expect(mail.sendInBackground).toHaveBeenCalledTimes(1);
+    expect(sentNotes(mail)[0]).toContain('picked up by the courier');
+    expect(statusLogs).toHaveLength(1);
+  });
+
+  it('does not email again when later statuses follow the pickup', async () => {
+    const { service, mail } = shipped();
+
+    await service.handleBiteshipWebhook({ order_id: 'bs-1', status: 'picked' });
+    await service.handleBiteshipWebhook({ order_id: 'bs-1', status: 'in_transit' });
+    await service.handleBiteshipWebhook({ order_id: 'bs-1', status: 'dropping_off' });
+
+    expect(mail.sendInBackground).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['confirmed', 'allocated', 'picking_up'])('stays quiet before the pickup on %s', async (status) => {
+    const { service, mail } = shipped();
+
+    await service.handleBiteshipWebhook({ order_id: 'bs-1', status });
+
+    expect(mail.sendInBackground).not.toHaveBeenCalled();
+  });
+
+  it('marks the order delivered and tells the buyer', async () => {
+    const { service, mail, order } = shipped();
+
+    await service.handleBiteshipWebhook({ order_id: 'bs-1', status: 'delivered' });
+
+    expect(order.status).toBe(OrderStatus.DELIVERED);
+    expect(sentNotes(mail)[0]).toContain('delivered');
+  });
+
+  it('ignores updates for orders that were not shipped', async () => {
+    const { service, mail, prisma } = shipped();
+    prisma.order.findFirst.mockResolvedValue(null);
+
+    await service.handleBiteshipWebhook({ order_id: 'bs-1', status: 'picked' });
+
+    expect(mail.sendInBackground).not.toHaveBeenCalled();
+  });
 });
 
 describe('MidtransService.getStatus', () => {
