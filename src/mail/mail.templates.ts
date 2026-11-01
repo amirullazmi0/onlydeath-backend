@@ -6,7 +6,7 @@ const layout = (body: string) => `
 <html><body style="margin:0;background:#f4f4f4;font-family:Arial,Helvetica,sans-serif;color:#111">
   <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:24px">
     <table width="600" cellpadding="0" cellspacing="0" style="background:#fff">
-      <tr><td style="background:#000;color:#fff;padding:20px 24px;font-size:22px;font-weight:900;letter-spacing:1px">{{appName}}</td></tr>
+      <tr><td style="background:#fff;padding:16px 24px 0;font-size:22px;font-weight:900;letter-spacing:1px"><img src="{{logoUrl}}" alt="{{appName}}" width="190" height="53" style="display:block;width:190px;height:53px;border:0" /></td></tr>
       <tr><td style="padding:24px;font-size:14px;line-height:1.6">${body}</td></tr>
       <tr><td style="padding:16px 24px;font-size:12px;color:#777;border-top:1px solid #e5e5e5">This is an automated email from {{appName}}.</td></tr>
     </table>
@@ -40,7 +40,7 @@ const sources = {
     <!-- Header: logo left, "Invoice" right, lined up with the PRICE column -->
     <table width="100%" cellpadding="0" cellspacing="0"><tr>
       <td valign="top">
-        <img src="{{logoUrl}}" alt="{{store.name}}" height="34" style="display:block;height:34px;width:auto;font-size:20px;font-weight:700" />
+        <img src="{{logoUrl}}" alt="{{store.name}}" width="190" height="53" style="display:block;width:190px;height:53px;border:0;font-size:20px;font-weight:700" />
         {{#if store.tagline}}<div style="font-size:11px;color:#777;margin-top:4px">{{store.tagline}}</div>{{/if}}
       </td>
       <td valign="top" width="280">
