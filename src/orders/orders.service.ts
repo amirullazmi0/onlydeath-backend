@@ -340,7 +340,7 @@ export class OrdersService {
       paid_at: order.paidAt,
       payment_method: order.payment?.paymentType ? paymentLabel(order.payment.paymentType) : null,
       exchange_rate: order.exchangeRate.toString(),
-      store: this.storeInfo(),
+      store: await this.storeInfo(),
       address: order.address,
       city: order.city,
       state: order.state,
@@ -458,7 +458,7 @@ export class OrdersService {
           },
         }),
       ]);
-      this.sendInvoice(order, n.payment_type, paidAt);
+      await this.sendInvoice(order, n.payment_type, paidAt);
       return;
     }
 
@@ -796,19 +796,30 @@ export class OrdersService {
     return `${this.config.getOrThrow('FE_URL')}/invoice?${params}`;
   }
 
-  /** Store details printed on invoices (from STORE_* env). */
-  storeInfo() {
+  /** Saved sender address, or null; a failed lookup must not block an invoice. */
+  private async originAddress() {
+    try {
+      const origin = await this.shipping.getOrigin();
+      return origin && `${origin.address}, ${origin.postalCode}`;
+    } catch (err) {
+      this.logger.warn(`Could not load the sender address: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  /** Store details printed on invoices: the sender address from admin settings, the rest from STORE_* env. */
+  async storeInfo() {
     return {
       name: this.config.get<string>('STORE_NAME') ?? 'ONLYDEATH',
       tagline: this.config.get<string>('STORE_TAGLINE') ?? '',
-      address: this.config.get<string>('STORE_ADDRESS') ?? '',
+      address: (await this.originAddress()) ?? this.config.get<string>('STORE_ADDRESS') ?? '',
       phone: this.config.get<string>('STORE_PHONE') ?? '',
       email: this.config.get<string>('STORE_EMAIL') ?? '',
       website: this.config.get<string>('STORE_WEBSITE') ?? '',
     };
   }
 
-  private sendInvoice(
+  private async sendInvoice(
     order: Prisma.OrderGetPayload<{ include: { items: true } }>,
     paymentType: string | undefined,
     paidAt: Date,
@@ -818,8 +829,7 @@ export class OrdersService {
     const originalSubtotal = order.subtotal + order.discountTotal;
 
     this.mail.sendInBackground(order.customerEmail, `Invoice ${order.orderNo}`, 'invoice', {
-      store: this.storeInfo(),
-      logoUrl: `${this.config.getOrThrow('FE_URL')}/brand/logo-black.png`,
+      store: await this.storeInfo(),
       orderNo: order.orderNo,
       invoiceDate: paidAt.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }),
       customerName: order.customerName,
