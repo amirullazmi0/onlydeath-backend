@@ -69,6 +69,10 @@ type OrderDetail = Prisma.OrderGetPayload<{ include: typeof detailInclude }>;
 const STALE_ORDER_MS = (PAYMENT_WINDOW_MINUTES + 2) * 60 * 1000;
 const STALE_ORDER_BATCH = 100;
 
+/** Biteship statuses that prove the courier has the package; later ones cover a missed "picked". */
+const PICKED_UP_STATUSES = ['picked', 'in_transit', 'dropping_off'];
+const PICKED_UP_NOTE = 'Picked up by the courier';
+
 @Injectable()
 export class OrdersService {
   private readonly logger = new Logger(OrdersService.name);
@@ -606,6 +610,8 @@ export class OrdersService {
     }
 
     const waybill = data.waybill as string | null | undefined;
+    // A Biteship booking only schedules the pickup; the webhook reports the real handover
+    const domestic = order.shippingType === ShippingType.DOMESTIC;
     const updated = await this.prisma.order.update({
       where: { id },
       data: {
@@ -615,14 +621,19 @@ export class OrdersService {
         logs: {
           create: {
             status: OrderStatus.SHIPPED,
-            note: `Handed to courier${waybill ? `, tracking no. ${waybill}` : ''}`,
+            note: `${domestic ? 'Courier pickup booked' : 'Handed to courier'}${waybill ? `, tracking no. ${waybill}` : ''}`,
             actor,
           },
         },
       },
       include: detailInclude,
     });
-    this.notifyStatus(updated, 'Your order has been handed over to the courier.');
+    this.notifyStatus(
+      updated,
+      domestic
+        ? 'Your courier pickup is booked. We will email you again once the courier has your package.'
+        : 'Your order has been handed over to the courier.',
+    );
     return updated;
   }
 
@@ -671,12 +682,25 @@ export class OrdersService {
       await this.prisma.order.updateMany({ where: { biteshipId: body.order_id }, data: shipment });
     }
 
-    if (body.status !== 'delivered') return;
+    const delivered = body.status === 'delivered';
+    if (!delivered && !PICKED_UP_STATUSES.includes(body.status ?? '')) return;
+
     const order = await this.prisma.order.findFirst({
       where: { biteshipId: body.order_id, status: OrderStatus.SHIPPED },
       include: detailInclude,
     });
-    if (order) await this.markDelivered(order, 'biteship');
+    if (!order) return;
+    if (delivered) {
+      await this.markDelivered(order, 'biteship');
+      return;
+    }
+
+    // Every later status repeats this path, and Biteship retries; the log keeps it to one email
+    if (order.logs.some((l) => l.note === PICKED_UP_NOTE)) return;
+    await this.prisma.orderStatusLog.create({
+      data: { orderId: order.id, status: OrderStatus.SHIPPED, note: PICKED_UP_NOTE, actor: 'biteship' },
+    });
+    this.notifyStatus(order, 'Your package has been picked up by the courier and is on its way to you.');
   }
 
   // ---------- helpers ----------
