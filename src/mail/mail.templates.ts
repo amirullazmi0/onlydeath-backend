@@ -107,7 +107,7 @@ const sources = {
           <tr><td style="padding:4px 0;color:#555">Shipping<br/><span style="font-size:11px">{{courierName}}</span></td><td align="right" valign="top" style="padding:4px 0;color:#555">{{shippingCost}}</td></tr>
           <tr><td colspan="2" style="padding-top:10px;border-bottom:1.5px solid #111;font-size:0;line-height:0">&nbsp;</td></tr>
           <tr><td style="padding:10px 0;font-size:14px;font-weight:700">Grand Total</td><td align="right" style="padding:10px 0;font-size:14px;font-weight:700">{{total}}</td></tr>
-          {{#if chargedIdr}}<tr><td colspan="2" style="font-size:11px;color:#777">Charged as {{chargedIdr}} via Midtrans</td></tr>{{/if}}
+          {{#if chargedIdr}}<tr><td colspan="2" style="font-size:11px;color:#777">Charged as {{chargedIdr}}</td></tr>{{/if}}
         </table>
       </td>
     </tr></table>
@@ -161,7 +161,7 @@ const sources = {
       {{/each}}
       <tr><td style="padding:8px 0">Shipping<br/><span style="font-size:12px;color:#777">{{courierName}}</span></td><td align="right" valign="top" style="padding:8px 0;white-space:nowrap">{{shippingCost}}</td></tr>
       <tr><td style="padding:8px 0;border-top:2px solid #000;font-weight:bold">Total</td><td align="right" style="padding:8px 0;border-top:2px solid #000;font-weight:bold;white-space:nowrap">{{total}}</td></tr>
-      {{#if chargedIdr}}<tr><td colspan="2" style="font-size:12px;color:#777">Charged as {{chargedIdr}} via Midtrans</td></tr>{{/if}}
+      {{#if chargedIdr}}<tr><td colspan="2" style="font-size:12px;color:#777">Charged as {{chargedIdr}}</td></tr>{{/if}}
     </table>
     <p style="margin-top:24px">${button('{{payUrl}}', 'Pay Now')}</p>
     <p style="font-size:12px;color:#777">Changed your mind, or want a different payment method? <a href="{{cancelUrl}}" style="color:#111">Cancel this order</a>. Your items go back to your cart so you can check out again.</p>`),
