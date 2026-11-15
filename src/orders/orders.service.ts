@@ -17,7 +17,10 @@ import { Currency, OrderStatus, ProductAvailability, ShippingType } from '../gen
 import { FxService } from '../fx/fx.service.js';
 import { activeDiscountPct, applyDiscount } from '../products/pricing.js';
 import type { Prisma } from '../generated/prisma/client.js';
-import { MidtransNotification, MidtransService, PAYMENT_WINDOW_MINUTES } from './midtrans.service.js';
+import type { MayarWebhook } from './mayar.service.js';
+import type { MidtransNotification } from './midtrans.service.js';
+import { GatewayStatus, PAYMENT_WINDOW_MINUTES, PaymentGatewayName } from './payment-gateway.js';
+import { PaymentGatewaysService } from './payment-gateways.service.js';
 import { CheckoutDto, ManualShipDto, OrderQueryDto, TrackQueryDto } from './dto/order.dto.js';
 
 type Tx = Prisma.TransactionClient;
@@ -41,21 +44,45 @@ export const money = (n: number, currency: Currency) =>
 const countryName = (code: string) =>
   new Intl.DisplayNames(['en'], { type: 'region' }).of(code) ?? code;
 
-/** Human label for Midtrans payment_type values. */
-export const paymentLabel = (type?: string | null) =>
-  type
-    ? ({
-        bank_transfer: 'Bank Transfer (VA)',
-        echannel: 'Mandiri Bill',
-        credit_card: 'Credit / Debit Card',
-        qris: 'QRIS',
-        gopay: 'GoPay',
-        shopeepay: 'ShopeePay',
-        cstore: 'Convenience Store',
-        akulaku: 'Akulaku',
-        kredivo: 'Kredivo',
-      }[type] ?? type.replaceAll('_', ' '))
-    : 'Midtrans';
+const MIDTRANS_LABELS: Record<string, string> = {
+  bank_transfer: 'Bank Transfer (VA)',
+  echannel: 'Mandiri Bill',
+  credit_card: 'Credit / Debit Card',
+  gopay: 'GoPay',
+  shopeepay: 'ShopeePay',
+  cstore: 'Convenience Store',
+  akulaku: 'Akulaku',
+  kredivo: 'Kredivo',
+};
+
+/**
+ * Human label for the payment channel a gateway reports: Midtrans payment_type
+ * values ("bank_transfer") or Mayar channels ("qris", "va/bni", "ewallet/gopay").
+ */
+export const paymentLabel = (type?: string | null) => {
+  if (!type) return 'Online Payment';
+  if (MIDTRANS_LABELS[type]) return MIDTRANS_LABELS[type];
+  if (type.toLowerCase() === 'mayar') return 'Mayar';
+  const [group, channel] = type.toLowerCase().split(/[/_\s-]+/);
+  const name = channel ? channel.toUpperCase() : '';
+  switch (group) {
+    case 'qris':
+      return 'QRIS';
+    case 'va':
+      return `Bank Transfer (VA${name ? ` ${name}` : ''})`;
+    case 'ewallet':
+      return name ? name.charAt(0) + name.slice(1).toLowerCase() : 'E-Wallet';
+    case 'outlet':
+      return 'Convenience Store';
+    case 'cc':
+    case 'card':
+    case 'credit':
+    case 'creditcard':
+      return 'Credit / Debit Card';
+    default:
+      return type.replaceAll('_', ' ');
+  }
+};
 
 const detailInclude = {
   items: true,
@@ -81,7 +108,7 @@ export class OrdersService {
     private readonly prisma: PrismaService,
     private readonly shipping: ShippingService,
     private readonly biteship: BiteshipService,
-    private readonly midtrans: MidtransService,
+    private readonly gateways: PaymentGatewaysService,
     private readonly fx: FxService,
     private readonly mail: MailService,
     private readonly config: ConfigService,
@@ -92,7 +119,7 @@ export class OrdersService {
   async checkout(dto: CheckoutDto) {
     const isDomestic = dto.country_code === 'ID';
     // Indonesia pays in IDR; everyone else sees USD and is charged the IDR
-    // equivalent (Midtrans settles in IDR), with the rate locked here.
+    // equivalent (the payment gateway settles in IDR), with the rate locked here.
     const currency = isDomestic ? Currency.IDR : Currency.USD;
     // Prices differ per currency, so a mismatch means the buyer saw the wrong total
     if (dto.currency !== currency) {
@@ -208,9 +235,10 @@ export class OrdersService {
     });
 
     try {
-      const snap = await this.midtrans.createSnap({
+      const gateway = this.gateways.current;
+      const payment = await gateway.createPayment({
         orderNo,
-        grossAmount: order.chargeTotal,
+        amount: order.chargeTotal,
         items: [
           ...order.items.map((i) => ({
             id: i.sizeId ?? i.productId ?? i.id,
@@ -222,25 +250,21 @@ export class OrdersService {
         ],
         customer: { name: order.customerName, email: order.customerEmail, phone: order.customerPhone },
         // VA, QRIS and e-wallets need an Indonesian account; cards work from anywhere
-        ...(!isDomestic && { enabledPayments: ['credit_card'] }),
+        cardOnly: !isDomestic,
       });
 
       await this.prisma.payment.create({
         data: {
           orderId: order.id,
-          snapToken: snap.token,
-          redirectUrl: snap.redirectUrl,
+          gateway: gateway.name,
+          gatewayRef: payment.ref,
+          redirectUrl: payment.paymentUrl,
           grossAmount: order.chargeTotal,
         },
       });
       this.sendPaymentRequest(order);
 
-      return {
-        order_no: orderNo,
-        snap_token: snap.token,
-        redirect_url: snap.redirectUrl,
-        client_key: this.midtrans.clientKey,
-      };
+      return { order_no: orderNo, payment_url: payment.paymentUrl };
     } catch (err) {
       await this.prisma.$transaction((tx) =>
         this.closeUnpaid(tx, order.id, OrderStatus.CANCELLED, 'Payment could not be created'),
@@ -259,22 +283,23 @@ export class OrdersService {
   }
 
   /**
-   * Buyer cancels an unpaid order, also how they switch payment method: Snap locks
-   * the method once picked and an order id cannot be reused, so they check out again.
-   * Midtrans is asked first because a payment may have landed before its webhook.
+   * Buyer cancels an unpaid order, also how they switch payment method. The
+   * gateway is asked first because a payment may have landed before its
+   * webhook; otherwise the payment is closed so it cannot take money for an
+   * order that no longer holds stock.
    */
   async cancel(dto: TrackQueryDto) {
     const order = await this.findForBuyer(dto);
     this.assertStatus(order.status, [OrderStatus.PENDING_PAYMENT]);
 
-    const transaction = await this.midtrans.getStatus(order.orderNo);
-    if (transaction) {
-      const outcome = this.midtrans.resolveOutcome(transaction);
-      if (outcome === 'PAID') {
-        await this.applyPaymentStatus(transaction);
+    if (order.payment?.gatewayRef) {
+      const gateway = this.gateways.get(order.payment.gateway);
+      const status = await gateway.getStatus(order.payment.gatewayRef);
+      if (status?.outcome === 'PAID') {
+        await this.applyPaymentStatus(order.id, status);
         throw new ConflictException('This order has already been paid');
       }
-      if (outcome === 'PENDING') await this.midtrans.cancel(order.orderNo);
+      if (status?.outcome === 'PENDING') await gateway.close(order.payment.gatewayRef);
     }
 
     await this.prisma.$transaction((tx) =>
@@ -372,63 +397,72 @@ export class OrdersService {
         availability: i.availability,
       })),
       logs: order.logs.map((l) => ({ status: l.status, note: l.note, created_at: l.createdAt })),
-      // Lets the buyer reopen Snap if they closed the popup before paying
+      // Lets the buyer go back to the payment page if they left before paying
       payment:
-        order.status === OrderStatus.PENDING_PAYMENT && order.payment
-          ? {
-              snap_token: order.payment.snapToken,
-              redirect_url: order.payment.redirectUrl,
-              client_key: this.midtrans.clientKey,
-            }
+        order.status === OrderStatus.PENDING_PAYMENT && order.payment?.redirectUrl
+          ? { payment_url: order.payment.redirectUrl }
           : null,
       tracking,
     };
   }
 
-  // ---------- Midtrans webhook ----------
+  // ---------- Mayar webhook ----------
 
   /**
-   * A notification only says "look at this order". The state comes from Midtrans
+   * A webhook only says "look at this payment". The state comes from the gateway
    * itself over our authenticated API call, so a forged request changes nothing.
-   * Unknown ids get a 2xx: the dashboard's test button sends one, and an error
-   * would fail that test and make Midtrans retry an order that will never exist.
+   * Unknown ids get a 2xx: dashboard test buttons send one, and an error would
+   * make the gateway retry a payment that will never exist.
    */
-  async handleMidtransNotification(n: Pick<MidtransNotification, 'order_id'>) {
-    const orderNo = n?.order_id;
-    const known =
-      typeof orderNo === 'string' &&
-      (await this.prisma.order.findUnique({ where: { orderNo }, select: { id: true } }));
-    if (!known) {
-      this.logger.warn(`Ignored Midtrans notification for unknown order ${String(orderNo)}`);
+  private async handleWebhook(gateway: PaymentGatewayName, ids: unknown[]) {
+    const refs = ids.filter((v): v is string => typeof v === 'string' && v.length > 0);
+    const payment = refs.length
+      ? await this.prisma.payment.findFirst({
+          where: { gateway, gatewayRef: { in: refs } },
+          select: { orderId: true, gatewayRef: true },
+        })
+      : null;
+    if (!payment?.gatewayRef) {
+      this.logger.warn(`Ignored ${gateway} webhook for unknown payment ${refs.join(', ') || '(none)'}`);
       return;
     }
 
-    const status = await this.midtrans.getStatus(orderNo);
-    if (status) await this.applyPaymentStatus(status);
+    const status = await this.gateways.get(gateway).getStatus(payment.gatewayRef);
+    if (status) await this.applyPaymentStatus(payment.orderId, status);
   }
 
-  private async applyPaymentStatus(n: MidtransNotification) {
+  /** Mayar's docs do not say whether data.id is the payment request or its transaction, so both are tried. */
+  handleMayarWebhook(body: MayarWebhook) {
+    return this.handleWebhook('mayar', [body?.data?.productId, body?.data?.id]);
+  }
+
+  /** Midtrans payments are keyed by our order number. */
+  handleMidtransNotification(n: Pick<MidtransNotification, 'order_id'>) {
+    return this.handleWebhook('midtrans', [n?.order_id]);
+  }
+
+  private async applyPaymentStatus(orderId: string, s: GatewayStatus) {
     const order = await this.prisma.order.findUnique({
-      where: { orderNo: n.order_id },
+      where: { id: orderId },
       include: { items: true, payment: true },
     });
     if (!order) return;
 
-    const outcome = this.midtrans.resolveOutcome(n);
+    const { outcome, paymentType } = s;
     const paymentData = {
-      paymentType: n.payment_type,
-      transactionId: n.transaction_id,
-      transactionStatus: n.transaction_status,
-      rawNotification: n as unknown as Prisma.InputJsonValue,
+      ...(paymentType && { paymentType }),
+      ...(s.transactionId && { transactionId: s.transactionId }),
+      transactionStatus: s.status,
+      rawNotification: s.raw as Prisma.InputJsonValue,
     };
 
-    // Midtrans retries notifications; only PENDING_PAYMENT orders can transition
+    // Webhooks and the cron can both report a payment; only PENDING_PAYMENT orders transition
     if (order.status !== OrderStatus.PENDING_PAYMENT) {
       await this.prisma.payment.update({ where: { orderId: order.id }, data: paymentData });
-      // A Snap tab left open can still be paid after the order closed; its stock is
+      // A payment page left open can still be paid after the order closed; its stock is
       // gone, so the admin has to refund it. Retried webhooks must not log this twice.
       const closed = order.status === OrderStatus.CANCELLED || order.status === OrderStatus.EXPIRED;
-      if (outcome === 'PAID' && closed && order.payment?.transactionStatus !== n.transaction_status) {
+      if (outcome === 'PAID' && closed && order.payment?.transactionStatus !== s.status) {
         this.logger.warn(`Payment received after ${order.orderNo} closed`);
         await this.prisma.orderStatusLog.create({
           data: {
@@ -454,20 +488,19 @@ export class OrdersService {
           data: {
             status: OrderStatus.PAID,
             paidAt,
-            logs: { create: { status: OrderStatus.PAID, note: `Paid via ${n.payment_type}` } },
+            logs: { create: { status: OrderStatus.PAID, note: `Paid via ${paymentLabel(paymentType)}` } },
           },
         }),
       ]);
-      await this.sendInvoice(order, n.payment_type, paidAt);
+      await this.sendInvoice(order, paymentType, paidAt);
       return;
     }
 
     if (outcome === 'FAILED') {
-      const status =
-        n.transaction_status === 'expire' ? OrderStatus.EXPIRED : OrderStatus.CANCELLED;
+      const status = s.expired ? OrderStatus.EXPIRED : OrderStatus.CANCELLED;
       const closed = await this.prisma.$transaction(async (tx) => {
         await tx.payment.update({ where: { orderId: order.id }, data: paymentData });
-        return this.closeUnpaid(tx, order.id, status, `Payment ${n.transaction_status}`);
+        return this.closeUnpaid(tx, order.id, status, `Payment ${s.status}`);
       });
       if (closed && status === OrderStatus.EXPIRED) this.notifyExpired(order);
       return;
@@ -477,9 +510,10 @@ export class OrdersService {
   }
 
   /**
-   * Midtrans never notifies about a Snap the buyer closed before picking a
-   * payment method, so those orders would hold their stock forever. Anything
-   * Midtrans does know about goes through the normal notification flow.
+   * Mayar sends no webhook when a payment expires, and Midtrans none for a Snap
+   * the buyer closed before picking a method, so orders past the payment window
+   * are checked here: settled ones go through the normal flow, unpaid ones are
+   * closed at the gateway and their stock released.
    */
   @Cron('* * * * *')
   async expireStaleOrders() {
@@ -490,14 +524,18 @@ export class OrdersService {
       },
       orderBy: { createdAt: 'asc' },
       take: STALE_ORDER_BATCH,
+      include: { payment: { select: { gateway: true, gatewayRef: true } } },
     });
 
     for (const order of orders) {
       try {
-        const status = await this.midtrans.getStatus(order.orderNo);
-        if (status) {
-          await this.applyPaymentStatus(status);
+        const ref = order.payment?.gatewayRef;
+        const gateway = order.payment && this.gateways.get(order.payment.gateway);
+        const status = gateway && ref ? await gateway.getStatus(ref) : null;
+        if (status && status.outcome !== 'PENDING') {
+          await this.applyPaymentStatus(order.id, status);
         } else {
+          if (status && gateway && ref) await gateway.close(ref);
           const closed = await this.prisma.$transaction((tx) =>
             this.closeUnpaid(tx, order.id, OrderStatus.EXPIRED, 'Payment window expired'),
           );
@@ -857,7 +895,7 @@ export class OrdersService {
       discountTotal: order.discountTotal ? `- ${m(order.discountTotal)}` : null,
       shippingCost: m(order.shippingCost),
       total: m(order.total),
-      // International buyers are charged the IDR equivalent by Midtrans
+      // International buyers are charged the IDR equivalent by the payment gateway
       chargedIdr: order.currency === Currency.USD ? money(order.chargeTotal, Currency.IDR) : null,
       trackUrl: this.trackUrl(order.orderNo),
       invoiceUrl: this.invoiceUrl(order.orderNo, order.customerEmail),
