@@ -10,7 +10,7 @@ import { ConfigService } from '@nestjs/config';
 const CACHE_MS = 60 * 60 * 1000;
 
 /**
- * USD -> IDR rate used to charge international orders through Midtrans (IDR only).
+ * USD -> IDR rate used to charge international orders through the payment gateway (IDR only).
  * Fetched from a free, keyless API and cached for an hour; USD_IDR_FALLBACK_RATE
  * keeps checkout working if the API is unreachable.
  */

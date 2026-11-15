@@ -212,7 +212,7 @@ model Order {
   total          Int
   /// IDR per 1 USD locked at checkout (1 for IDR orders)
   exchangeRate   Decimal      @default(1) @map("exchange_rate") @db.Decimal(14, 4)
-  /// What Midtrans actually charges, always IDR
+  /// What the payment gateway actually charges, always IDR
   chargeTotal    Int          @map("charge_total")
   chargeShipping Int          @map("charge_shipping")
   rejectReason   String?      @map("reject_reason") @db.Text
@@ -261,7 +261,11 @@ model OrderItem {
 model Payment {
   id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   orderId           String    @unique @map("order_id") @db.Uuid
-  snapToken         String?   @map("snap_token") @db.Text
+  /// "mayar" or "midtrans": the gateway this payment was created with
+  gateway           String    @db.VarChar(20)
+  /// Id the gateway's status API takes: Mayar payment request id, or our order number on Midtrans
+  gatewayRef        String?   @map("gateway_ref") @db.VarChar(255)
+  /// Hosted payment page the buyer is sent to
   redirectUrl       String?   @map("redirect_url") @db.Text
   paymentType       String?   @map("payment_type") @db.VarChar(50)
   transactionId     String?   @map("transaction_id") @db.VarChar(255)
@@ -274,6 +278,7 @@ model Payment {
 
   order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
+  @@unique([gateway, gatewayRef])
   @@map("payments")
 }
 

@@ -1,9 +1,10 @@
 import { Controller, Get, Injectable, Module, Query } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { IsDateString, IsOptional } from 'class-validator';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { OrderStatus } from '../generated/prisma/enums.js';
 import { REVENUE_STATUSES } from '../dashboard/dashboard.module.js';
+import { OrdersModule } from '../orders/orders.module.js';
+import { PaymentGatewaysService } from '../orders/payment-gateways.service.js';
 
 class FinanceQueryDto {
   @IsOptional()
@@ -16,14 +17,14 @@ class FinanceQueryDto {
 }
 
 /**
- * Midtrans has no API to withdraw the merchant balance, so this page only
- * summarises what should be in the Midtrans account and links to its dashboard.
+ * Withdrawals happen in the payment gateway's dashboard, so this page only
+ * summarises what should be in that balance and links to the dashboard.
  */
 @Injectable()
 export class FinanceService {
   constructor(
     private readonly prisma: PrismaService,
-    private readonly config: ConfigService,
+    private readonly gateways: PaymentGatewaysService,
   ) {}
 
   async summary({ from, to }: FinanceQueryDto) {
@@ -38,7 +39,7 @@ export class FinanceService {
         _sum: { chargeTotal: true, chargeShipping: true },
         _count: { _all: true },
       }),
-      // Rejected after payment: money sits in Midtrans and must be refunded manually
+      // Rejected after payment: money sits in the gateway and must be refunded manually
       this.prisma.order.aggregate({
         where: { status: OrderStatus.REJECTED, paidAt: { not: null, ...paidAt } },
         _sum: { chargeTotal: true },
@@ -71,11 +72,8 @@ export class FinanceService {
         total: m._sum.grossAmount ?? 0,
         count: m._count._all,
       })),
-      midtrans_dashboard_url:
-        this.config.get('MIDTRANS_DASHBOARD_URL') ??
-        (this.config.get('MIDTRANS_IS_PRODUCTION') === 'true'
-          ? 'https://dashboard.midtrans.com'
-          : 'https://dashboard.sandbox.midtrans.com'),
+      gateway_name: this.gateways.current.name === 'midtrans' ? 'Midtrans' : 'Mayar',
+      gateway_dashboard_url: this.gateways.current.dashboardUrl,
     };
   }
 }
@@ -91,6 +89,7 @@ export class FinanceController {
 }
 
 @Module({
+  imports: [OrdersModule],
   controllers: [FinanceController],
   providers: [FinanceService],
 })

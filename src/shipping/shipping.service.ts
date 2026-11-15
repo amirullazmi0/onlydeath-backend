@@ -56,7 +56,7 @@ export class ShippingService {
     const rates = await this.quote(dto, lines);
     if (dto.country_code === 'ID') return rates;
 
-    // Buyers abroad see USD but Midtrans charges IDR, so show the amount before they
+    // Buyers abroad see USD but the payment gateway charges IDR, so show the amount before they
     // pay. Built per unit like the checkout total, which must match it exactly.
     const fxRate = await this.fx.usdToIdr();
     const goods = lines.reduce(

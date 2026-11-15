@@ -1,8 +1,11 @@
 import { BadGatewayException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-
-/** How long a buyer has to pay, counted from checkout. */
-export const PAYMENT_WINDOW_MINUTES = 10;
+import {
+  CreatePaymentRequest,
+  GatewayStatus,
+  PAYMENT_WINDOW_MINUTES,
+  PaymentGateway,
+} from './payment-gateway.js';
 
 /** "YYYY-MM-DD HH:MM:SS +0700", the only format Snap accepts */
 const midtransTime = (date: Date) =>
@@ -18,17 +21,13 @@ export interface MidtransNotification {
   fraud_status?: string;
 }
 
-export interface SnapRequest {
-  orderNo: string;
-  grossAmount: number;
-  items: { id: string; name: string; price: number; quantity: number }[];
-  customer: { name: string; email: string; phone: string };
-  /** Limits Snap to these methods; every enabled method is offered when omitted */
-  enabledPayments?: string[];
-}
-
+/**
+ * Midtrans Snap, used through its hosted redirect page. The payment is keyed
+ * by our order number, which is also what Midtrans notifications carry.
+ */
 @Injectable()
-export class MidtransService {
+export class MidtransService implements PaymentGateway {
+  readonly name = 'midtrans' as const;
   private readonly logger = new Logger(MidtransService.name);
 
   constructor(private readonly config: ConfigService) {}
@@ -41,25 +40,29 @@ export class MidtransService {
     return this.isProduction ? 'https://api.midtrans.com' : 'https://api.sandbox.midtrans.com';
   }
 
-  private get serverKey() {
-    return this.config.getOrThrow<string>('MIDTRANS_SERVER_KEY');
+  get dashboardUrl() {
+    return (
+      this.config.get<string>('MIDTRANS_DASHBOARD_URL') ??
+      (this.isProduction ? 'https://dashboard.midtrans.com' : 'https://dashboard.sandbox.midtrans.com')
+    );
   }
 
-  async createSnap(req: SnapRequest) {
+  private get authHeader() {
+    const key = this.config.getOrThrow<string>('MIDTRANS_SERVER_KEY');
+    return `Basic ${Buffer.from(`${key}:`).toString('base64')}`;
+  }
+
+  async createPayment(req: CreatePaymentRequest) {
     const url = this.isProduction
       ? 'https://app.midtrans.com/snap/v1/transactions'
       : 'https://app.sandbox.midtrans.com/snap/v1/transactions';
 
     const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        Authorization: `Basic ${Buffer.from(`${this.serverKey}:`).toString('base64')}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
+      headers: { Authorization: this.authHeader, 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({
-        transaction_details: { order_id: req.orderNo, gross_amount: req.grossAmount },
-        ...(req.enabledPayments && { enabled_payments: req.enabledPayments }),
+        transaction_details: { order_id: req.orderNo, gross_amount: req.amount },
+        ...(req.cardOnly && { enabled_payments: ['credit_card'] }),
         // Midtrans rejects item names over 50 chars
         item_details: req.items.map((i) => ({ ...i, name: i.name.slice(0, 50) })),
         customer_details: {
@@ -79,28 +82,25 @@ export class MidtransService {
       }),
     });
 
-    const body = (await res.json()) as {
+    const body = (await res.json().catch(() => ({}))) as {
       token?: string;
       redirect_url?: string;
       error_messages?: string[];
     };
-    if (!res.ok || !body.token) {
+    if (!res.ok || !body.token || !body.redirect_url) {
       this.logger.error(`Snap create failed: ${JSON.stringify(body.error_messages)}`);
       throw new BadGatewayException('Could not create payment, please try again');
     }
-    return { token: body.token, redirectUrl: body.redirect_url ?? null };
+    return { ref: req.orderNo, paymentUrl: body.redirect_url };
   }
 
   /**
    * Current transaction state, or null when Midtrans has none: Snap only creates
    * one after the buyer picks a payment method.
    */
-  async getStatus(orderNo: string) {
+  async getStatus(orderNo: string): Promise<GatewayStatus | null> {
     const res = await fetch(`${this.apiBase}/v2/${encodeURIComponent(orderNo)}/status`, {
-      headers: {
-        Authorization: `Basic ${Buffer.from(`${this.serverKey}:`).toString('base64')}`,
-        Accept: 'application/json',
-      },
+      headers: { Authorization: this.authHeader, Accept: 'application/json' },
     });
 
     const body = (await res.json().catch(() => ({}))) as Partial<MidtransNotification>;
@@ -109,34 +109,38 @@ export class MidtransService {
     if (!res.ok || !body.transaction_status) {
       throw new Error(`Midtrans status failed for ${orderNo}: ${res.status} ${body.status_code ?? ''}`);
     }
-    return body as MidtransNotification;
+
+    const n = body as MidtransNotification;
+    return {
+      outcome: this.resolveOutcome(n),
+      status: n.transaction_status,
+      expired: n.transaction_status === 'expire',
+      paymentType: n.payment_type,
+      transactionId: n.transaction_id,
+      raw: n,
+    };
   }
 
   /** Voids a transaction the buyer has not paid yet, so its VA or QR stops working. */
-  async cancel(orderNo: string) {
+  async close(orderNo: string) {
     const res = await fetch(`${this.apiBase}/v2/${encodeURIComponent(orderNo)}/cancel`, {
       method: 'POST',
-      headers: {
-        Authorization: `Basic ${Buffer.from(`${this.serverKey}:`).toString('base64')}`,
-        Accept: 'application/json',
-      },
+      headers: { Authorization: this.authHeader, Accept: 'application/json' },
     });
     const body = (await res.json().catch(() => ({}))) as { status_code?: string; status_message?: string };
-    if (!res.ok || !['200', '412'].includes(body.status_code ?? '')) {
+    // 404: buyer never picked a method, so there is nothing to void; 412: already final
+    if (res.status === 404 || body.status_code === '404') return;
+    if (!['200', '412'].includes(body.status_code ?? '')) {
       this.logger.error(`Midtrans cancel failed for ${orderNo}: ${body.status_code} ${body.status_message}`);
       throw new BadGatewayException('Could not cancel the payment, please try again');
     }
   }
 
   /** Maps Midtrans transaction state to our outcome. */
-  resolveOutcome(n: MidtransNotification): 'PAID' | 'FAILED' | 'PENDING' {
+  resolveOutcome(n: Pick<MidtransNotification, 'transaction_status' | 'fraud_status'>): GatewayStatus['outcome'] {
     if (n.transaction_status === 'settlement') return 'PAID';
     if (n.transaction_status === 'capture') return n.fraud_status === 'accept' ? 'PAID' : 'PENDING';
     if (['expire', 'cancel', 'deny', 'failure'].includes(n.transaction_status)) return 'FAILED';
     return 'PENDING';
-  }
-
-  get clientKey() {
-    return this.config.get<string>('MIDTRANS_CLIENT_KEY') ?? '';
   }
 }
