@@ -45,6 +45,9 @@ export class MayarService implements PaymentGateway {
   }
 
   private get apiBase() {
+    // MAYAR_API_URL points at the local mock (yarn mock:mayar) while the sandbox is unreachable
+    const override = this.config.get<string>('MAYAR_API_URL');
+    if (override) return override.replace(/\/+$/, '');
     return this.isProduction ? 'https://api.mayar.id/hl/v2' : 'https://api.mayar.io/hl/v2';
   }
 
